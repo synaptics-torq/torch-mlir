@@ -1007,6 +1007,7 @@ public:
     };
 
     if (transposed) {
+
       bool isGroupedConv = numGroups > 1;
       weight = isGroupedConv ? expandWeight(weight) : weight;
 
@@ -1264,14 +1265,30 @@ public:
         cast<RankedTensorType>(input.getType()).getShape());
     auto weightShape = makeShapeTorchCompatible(
         cast<RankedTensorType>(weight.getType()).getShape());
-    if (inShape[1] == numGroups && weightShape[0] == numGroups &&
-        weightShape[1] == 1) {
-      // Collapse weight shape (C/G == 1)
-      SmallVector<ReassociationIndices> collapsedDims = {{0, 1}};
-      SmallVector<int64_t> collapsedShape{weightShape[0] * weightShape[1]};
-      for (unsigned i = 0; i < numSpatialDims; i++) {
-        collapsedDims.push_back({i + 2});
-        collapsedShape.push_back(weightShape[i + 2]);
+    if (weightShape[0] != kUnknownSize && inShape[1] == numGroups &&
+        weightShape[0] % inShape[1] == 0 && weightShape[1] == 1 && !inputZp) {
+      // Collapse weight shape
+      // For transposed conv, weight is already expanded to [G, C/G, F, H, W] (5D)
+      // For normal conv, weight is [F, C, H, W] (4D)
+      bool weightExpanded = (cast<RankedTensorType>(weight.getType()).getRank() == 5);
+      
+      SmallVector<ReassociationIndices, 4> collapsedDims;
+      SmallVector<int64_t> collapsedShape;
+      if (weightExpanded) {
+        // Weight is [G, C/G, F, H, W] -> collapse to [G*C/G*F, H, W]
+        collapsedDims = {{0, 1, 2}, {3}, {4}};
+        collapsedShape = {
+            (weightShape[0] == kUnknownSize ? kUnknownSize
+                                            : weightShape[0] * weightShape[1] * weightShape[2]),
+            weightShape[3], weightShape[4]};
+      }
+      else {
+        // Weight is [F, C, H, W] -> collapse to [F*C, H, W]
+        collapsedDims = {{0, 1}, {2}, {3}};
+        collapsedShape = {
+            (weightShape[0] == kUnknownSize ? kUnknownSize
+                                            : weightShape[0] * weightShape[1]),
+            weightShape[2], weightShape[3]};
       }
       Type collapsedType = RankedTensorType::get(
           makeShapeLLVMCompatible(collapsedShape), weightDTy);
