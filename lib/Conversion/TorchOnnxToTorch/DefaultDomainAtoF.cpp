@@ -1160,6 +1160,17 @@ void mlir::torch::onnx_c::populateDefaultDomainAtoF(
             }
             denseAttr = DenseElementsAttr::get(ty, newContents);
           } else {
+            auto elemTy = ty.getElementType();
+            // Sub-byte element types (for example ui4) may be valid in a
+            // DenseResourceElementsAttr but are not always accepted by
+            // DenseElementsAttr::getFromRawBuffer. Preserve the resource form
+            // and let downstream Torch lowering handle it.
+            if (elemTy.isIntOrFloat() &&
+                elemTy.getIntOrFloatBitWidth() % 8 != 0) {
+              rewriter.replaceOpWithNewOp<Torch::ValueTensorLiteralOp>(
+                  binder.op, resultType, attr);
+              return success();
+            }
             denseAttr = DenseElementsAttr::getFromRawBuffer(ty, data);
           }
 
@@ -2351,17 +2362,140 @@ void mlir::torch::onnx_c::populateDefaultDomainAtoF(
 
         auto operandTy = cast<Torch::ValueTensorType>(operand.getType());
         auto scaleTy = dyn_cast<Torch::ValueTensorType>(scale.getType());
+        auto zeropointTy = dyn_cast<Torch::ValueTensorType>(zeropoint.getType());
         if (!scaleTy || !scaleTy.hasSizes())
           return rewriter.notifyMatchFailure(binder.op, "requires known rank");
+        if (!zeropointTy || !zeropointTy.hasSizes())
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "requires known zero point rank");
+        if (!operandTy.hasSizes())
+          return rewriter.notifyMatchFailure(binder.op,
+                                             "requires known operand rank");
         if (!resultType.hasDtype())
           return rewriter.notifyMatchFailure(binder.op,
                                              "requires known result dtype");
 
+        Value none = Torch::ConstantNoneOp::create(rewriter, loc);
+        Value cstFalse = Torch::ConstantBoolOp::create(rewriter, loc, false);
+        auto tyVal = Torch::getScalarTypeForType(resultType.getDtype());
+        Value tyConst = Torch::ConstantIntOp::create(
+            rewriter, loc, rewriter.getType<Torch::IntType>(),
+            rewriter.getIntegerAttr(rewriter.getIntegerType(64),
+                                    static_cast<int64_t>(tyVal)));
+        Value one = Torch::ConstantFloatOp::create(
+            rewriter, loc, rewriter.getF64FloatAttr(1.0));
+
         int64_t scaleRank = scaleTy.getSizes().size();
-        if (scaleRank > 1)
-          return rewriter.notifyMatchFailure(
-              binder.op, "unimplemented: only per-tensor or per-axis "
-                         "quantization supported");
+        if (scaleRank > 1) {
+          auto operandShape = operandTy.getSizes();
+          auto scaleShape = scaleTy.getSizes();
+          auto zeropointShape = zeropointTy.getSizes();
+          if (operandShape.size() != scaleShape.size() ||
+              scaleShape != zeropointShape)
+            return rewriter.notifyMatchFailure(
+                binder.op,
+                "blocked quantization requires compatible operand, scale, "
+                "and zero point ranks");
+
+          int64_t axis;
+          if (binder.s64IntegerAttr(axis, "axis", 1))
+            return failure();
+          axis = Torch::toPositiveDim(axis, operandShape.size());
+
+          int64_t blockSize;
+          if (binder.s64IntegerAttr(blockSize, "block_size"))
+            return rewriter.notifyMatchFailure(
+                binder.op,
+                "blocked quantization requires a block_size attribute");
+          if (blockSize <= 0)
+            return rewriter.notifyMatchFailure(binder.op,
+                                               "block_size must be positive");
+
+          if (operandShape[axis] == Torch::kUnknownSize ||
+              scaleShape[axis] == Torch::kUnknownSize)
+            return rewriter.notifyMatchFailure(
+                binder.op, "blocked quantization requires static block axis");
+          if (operandShape[axis] != scaleShape[axis] * blockSize)
+            return rewriter.notifyMatchFailure(
+                binder.op,
+                "blocked quantization requires operand dim == scale dim * "
+                "block_size");
+          for (auto [idx, dims] :
+               llvm::enumerate(llvm::zip_equal(operandShape, scaleShape))) {
+            if (idx == static_cast<size_t>(axis))
+              continue;
+            if (std::get<0>(dims) != std::get<1>(dims))
+              return rewriter.notifyMatchFailure(
+                  binder.op,
+                  "blocked quantization requires non-axis dimensions to "
+                  "match");
+          }
+
+          SmallVector<int64_t> blockedOperandShape;
+          SmallVector<int64_t> blockedScaleShape;
+          blockedOperandShape.reserve(operandShape.size() + 1);
+          blockedScaleShape.reserve(scaleShape.size() + 1);
+          for (auto [idx, size] : llvm::enumerate(operandShape)) {
+            if (idx == static_cast<size_t>(axis)) {
+              blockedOperandShape.push_back(scaleShape[idx]);
+              blockedOperandShape.push_back(blockSize);
+              blockedScaleShape.push_back(scaleShape[idx]);
+              blockedScaleShape.push_back(1);
+              continue;
+            }
+            blockedOperandShape.push_back(size);
+            blockedScaleShape.push_back(scaleShape[idx]);
+          }
+
+          auto blockedResultType = rewriter.getType<Torch::ValueTensorType>(
+              blockedOperandShape, resultType.getDtype());
+          auto blockedScaleType = rewriter.getType<Torch::ValueTensorType>(
+              blockedScaleShape, scaleTy.getOptionalDtype());
+          auto blockedZpType = rewriter.getType<Torch::ValueTensorType>(
+              blockedScaleShape, zeropointTy.getOptionalDtype());
+          auto blockedParamResultType = rewriter.getType<Torch::ValueTensorType>(
+              blockedScaleShape, resultType.getDtype());
+
+          Value blockedOperand = Torch::AtenReshapeOp::create(
+              rewriter, loc, operandTy.getWithSizesAndDtype(
+                                 blockedOperandShape,
+                                 operandTy.getOptionalDtype()),
+              operand, createConstantIntList(binder, rewriter,
+                                             blockedOperandShape));
+          Value blockedScale = Torch::AtenReshapeOp::create(
+              rewriter, loc, blockedScaleType, scale,
+              createConstantIntList(binder, rewriter, blockedScaleShape));
+          Value blockedZp = Torch::AtenReshapeOp::create(
+              rewriter, loc, blockedZpType, zeropoint,
+              createConstantIntList(binder, rewriter, blockedScaleShape));
+
+          blockedOperand = Torch::AtenToDtypeOp::create(
+              rewriter, loc, blockedResultType, blockedOperand, tyConst,
+              /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
+              /*memory_format=*/none);
+          if (blockedScaleType.getDtype() != resultType.getDtype()) {
+            blockedScale = Torch::AtenToDtypeOp::create(
+                rewriter, loc, blockedParamResultType, blockedScale, tyConst,
+                /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
+                /*memory_format=*/none);
+          }
+          if (blockedZpType.getDtype() != resultType.getDtype()) {
+            blockedZp = Torch::AtenToDtypeOp::create(
+                rewriter, loc, blockedParamResultType, blockedZp, tyConst,
+                /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
+                /*memory_format=*/none);
+          }
+
+          Value dequant = Torch::AtenSubTensorOp::create(
+              rewriter, loc, blockedResultType, blockedOperand, blockedZp, one);
+          dequant = Torch::AtenMulTensorOp::create(rewriter, loc,
+                                                   blockedResultType, dequant,
+                                                   blockedScale);
+          rewriter.replaceOpWithNewOp<Torch::AtenReshapeOp>(
+              binder.op, resultType, dequant,
+              createConstantIntList(binder, rewriter, operandShape));
+          return success();
+        }
         auto qTensorTy = getQTorchTypeFromTorchIntType(operandTy);
         if (!qTensorTy) {
           return rewriter.notifyMatchFailure(binder.op,
@@ -2415,20 +2549,11 @@ void mlir::torch::onnx_c::populateDefaultDomainAtoF(
         }
 
         // Case 3: Per-Tensor Quantization for floating point input.
-        Value none = Torch::ConstantNoneOp::create(rewriter, loc);
-        Value cstFalse = Torch::ConstantBoolOp::create(rewriter, loc, false);
-        auto tyVal = Torch::getScalarTypeForType(resultType.getDtype());
-        Value tyConst = Torch::ConstantIntOp::create(
-            rewriter, loc, rewriter.getType<Torch::IntType>(),
-            rewriter.getIntegerAttr(rewriter.getIntegerType(64),
-                                    static_cast<int64_t>(tyVal)));
         Value toDtype = Torch::AtenToDtypeOp::create(
             rewriter, loc, resultType, operand, tyConst,
             /*non_blocking=*/cstFalse, /*copy=*/cstFalse,
             /*memory_format=*/none);
 
-        Value one = Torch::ConstantFloatOp::create(
-            rewriter, loc, rewriter.getF64FloatAttr(1.0));
         Value sub = Torch::AtenSubScalarOp::create(rewriter, loc, resultType,
                                                    toDtype, zeropoint, one);
         rewriter.replaceOpWithNewOp<Torch::AtenMulScalarOp>(
