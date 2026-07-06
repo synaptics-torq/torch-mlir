@@ -25,27 +25,30 @@ namespace {
 static ElementsAttr getDenseAttrFromOnnxRawBuffer(ShapedType type,
                                                   ArrayRef<char> data) {
   auto intType = dyn_cast<IntegerType>(type.getElementType());
-  if (intType && intType.getWidth() > 1 && intType.getWidth() < 8 &&
-      type.hasStaticShape()) {
-    int64_t numElements = type.getNumElements();
-    unsigned bitWidth = intType.getWidth();
-    int64_t expectedBytes = (bitWidth * numElements + 7) / 8;
-    if (static_cast<int64_t>(data.size()) == expectedBytes) {
-      llvm::SmallVector<char> unpacked;
-      unpacked.reserve(numElements);
-      for (int64_t i = 0; i < numElements; ++i) {
-        uint8_t element = 0;
-        for (unsigned bit = 0; bit < bitWidth; ++bit) {
-          size_t rawBit = static_cast<size_t>(i) * bitWidth + bit;
-          if (static_cast<uint8_t>(data[rawBit / 8]) & (1u << (rawBit % 8)))
-            element |= 1u << bit;
-        }
-        unpacked.push_back(static_cast<char>(element));
-      }
-      return DenseElementsAttr::getFromRawBuffer(type, unpacked);
-    }
+  if (!(intType && intType.getWidth() > 1 && intType.getWidth() < 8 &&
+        type.hasStaticShape())) {
+    return DenseElementsAttr::getFromRawBuffer(type, data);
   }
-  return DenseElementsAttr::getFromRawBuffer(type, data);
+
+  int64_t numElements = type.getNumElements();
+  unsigned bitWidth = intType.getWidth();
+  int64_t expectedBytes = (bitWidth * numElements + 7) / 8;
+  if (static_cast<int64_t>(data.size()) != expectedBytes) {
+    return DenseElementsAttr::getFromRawBuffer(type, data);
+  }
+
+  llvm::SmallVector<char> unpacked;
+  unpacked.reserve(numElements);
+  for (int64_t i = 0; i < numElements; ++i) {
+    uint8_t element = 0;
+    for (unsigned bit = 0; bit < bitWidth; ++bit) {
+      size_t rawBit = static_cast<size_t>(i) * bitWidth + bit;
+      if (static_cast<uint8_t>(data[rawBit / 8]) & (1u << (rawBit % 8)))
+        element |= 1u << bit;
+    }
+    unpacked.push_back(static_cast<char>(element));
+  }
+  return DenseElementsAttr::getFromRawBuffer(type, unpacked);
 }
 
 LogicalResult windowFunctionImpl(OpBinder binder,
