@@ -2648,15 +2648,19 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Torch::ValueTensorType yType, meanType, invStdDevType;
         Value x, scale, b;
+        bool hasBias = binder.op->getNumOperands() == 3;
+        if (binder.op->getNumOperands() != 2 && !hasBias)
+          return failure();
         int64_t axis, stashType;
         float epsilon;
         if (binder.tensorOperandAtIndex(x, 0) ||
             binder.tensorOperandAtIndex(scale, 1) ||
-            binder.tensorOperandAtIndex(b, 2) ||
             binder.tensorResultTypeAtIndex(yType, 0) ||
             binder.s64IntegerAttr(axis, "axis", -1) ||
             binder.f32FloatAttr(epsilon, "epsilon", 0.00001f) ||
             binder.s64IntegerAttr(stashType, "stash_type", 1))
+          return failure();
+        if (hasBias && binder.tensorOperandAtIndex(b, 2))
           return failure();
 
         std::optional<int64_t> stashTypeIntTorch =
@@ -2675,6 +2679,8 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
         Value cstFalse =
             Torch::ConstantBoolOp::create(rewriter, binder.getLoc(), false);
         Value none = Torch::ConstantNoneOp::create(rewriter, binder.getLoc());
+        if (!hasBias)
+          b = none;
         if (*stashDtype != xType.getOptionalDtype()) {
           auto newXType =
               xType.getWithSizesAndDtype(xType.getOptionalSizes(), *stashDtype);
