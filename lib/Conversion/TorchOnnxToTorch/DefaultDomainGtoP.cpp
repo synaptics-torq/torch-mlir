@@ -592,6 +592,18 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
             mlir::IntegerType::get(binder.op->getContext(), 32,
                                    mlir::IntegerType::Signed));
 
+        // Converting the zero_point tensors to `si32` as well. They are
+        // subtracted from operands that are now si32, so they have to be
+        // widened the same way the operands were.
+        // A zero point defaulted above is a scalar ConstantIntOp, not a
+        // tensor, and needs no conversion.
+        auto si32Ty = mlir::IntegerType::get(binder.op->getContext(), 32,
+                                             mlir::IntegerType::Signed);
+        if (isa<Torch::ValueTensorType>(lhsZp.getType()))
+          lhsZp = Torch::convertTensorToDtype(rewriter, loc, lhsZp, si32Ty);
+        if (isa<Torch::ValueTensorType>(rhsZp.getType()))
+          rhsZp = Torch::convertTensorToDtype(rewriter, loc, rhsZp, si32Ty);
+
         // Subtracting the zero_point values from lhs and rhs.
         Value alpha = Torch::ConstantIntOp::create(
             rewriter, loc, rewriter.getI64IntegerAttr(1));
