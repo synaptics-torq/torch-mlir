@@ -2503,6 +2503,12 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
     Type int64type = rewriter.getI64Type();
+    // Integer grid coordinates are kept in i32: image dimensions and
+    // clamped pixel indices are far below 2^31, and the f32->i32 soft-float
+    // conversion (__fixsfsi) is small, while the f32->i64 one (__fixsfdi)
+    // range-checks through f64 and drags in ~4KB of double-precision
+    // compiler-rt that does not fit in the CSS ITCM budget.
+    Type int32type = rewriter.getI32Type();
     Type floatType = rewriter.getF32Type();
     Value oneIndex = arith::ConstantIndexOp::create(rewriter, loc, 1);
     Value zeroFloat = arith::ConstantOp::create(
@@ -2520,9 +2526,9 @@ public:
     Value innerDim1b =
         arith::SubIOp::create(rewriter, loc, innerDim1a, oneIndex);
     Value innerDim0c =
-        arith::IndexCastOp::create(rewriter, loc, int64type, innerDim0b);
+        arith::IndexCastOp::create(rewriter, loc, int32type, innerDim0b);
     Value innerDim1c =
-        arith::IndexCastOp::create(rewriter, loc, int64type, innerDim1b);
+        arith::IndexCastOp::create(rewriter, loc, int32type, innerDim1b);
     Value innerDim0d =
         arith::SIToFPOp::create(rewriter, loc, floatType, innerDim0c);
     Value innerDim1d =
@@ -2555,11 +2561,24 @@ public:
       return result;
     };
 
+    // Grid coordinates and the bilinear interpolation are computed in f32
+    // opmath, mirroring PyTorch's grid_sample, which upcasts fp16/bf16 inputs
+    // to a float opmath type for the coordinate math.  Element values (grid
+    // coords, extracted pixels) are extended to f32 as needed, and the final
+    // interpolated value is truncated back to the element type.  Without the
+    // extension the pattern mixes the element type with the f32 scalar
+    // constants below, producing invalid arith ops for non-f32 element types.
+    auto extfIf = [&](OpBuilder &b, Location loc, Value v) -> Value {
+      if (v.getType() == floatType)
+        return v;
+      return arith::ExtFOp::create(b, loc, floatType, v);
+    };
+
     auto lambdaLinear = [&](OpBuilder &b, Location loc, Value x, Value y,
                             Value d) -> Value {
       Value dm = arith::SubFOp::create(b, loc, oneFloat, d);
-      Value ra = arith::MulFOp::create(b, loc, x, dm);
-      Value rb = arith::MulFOp::create(b, loc, y, d);
+      Value ra = arith::MulFOp::create(b, loc, extfIf(b, loc, x), dm);
+      Value rb = arith::MulFOp::create(b, loc, extfIf(b, loc, y), d);
       Value res = arith::AddFOp::create(b, loc, ra, rb);
       return res;
     };
@@ -2570,7 +2589,8 @@ public:
           rewriter, loc, rewriter.getFloatAttr(floatType, 0.5));
       Value checkClosest = arith::CmpFOp::create(
           b, loc, arith::CmpFPredicate::OLT, d, halfConst);
-      Value res = arith::SelectOp::create(b, loc, checkClosest, x, y);
+      Value res = arith::SelectOp::create(
+          b, loc, checkClosest, extfIf(b, loc, x), extfIf(b, loc, y));
       return res;
     };
 
@@ -2605,8 +2625,8 @@ public:
         rewriter, loc, TypeRange{resultType}, ValueRange{grid, grid},
         ValueRange(emptyOp), gridMaps, gridIterators,
         [&](OpBuilder &b, Location loc, ValueRange args) {
-          Value gr0 = args[1];
-          Value gr1 = args[0];
+          Value gr0 = extfIf(b, loc, args[1]);
+          Value gr1 = extfIf(b, loc, args[0]);
           Value gr0Half = arith::DivFOp::create(b, loc, gr0, twoFloat);
           Value gr1Half = arith::DivFOp::create(b, loc, gr1, twoFloat);
           Value gr0HalfSelect =
@@ -2626,35 +2646,67 @@ public:
           Value checkLowerBound1 = arith::CmpFOp::create(
               b, loc, arith::CmpFPredicate::OLT, result1, zeroFloat);
           Value lowerOrig0 =
-              arith::FPToSIOp::create(b, loc, int64type, result0);
+              arith::FPToSIOp::create(b, loc, int32type, result0);
           Value lowerOrig1 =
-              arith::FPToSIOp::create(b, loc, int64type, result1);
+              arith::FPToSIOp::create(b, loc, int32type, result1);
           Value zeroInt =
-              arith::ConstantOp::create(b, loc, b.getIntegerAttr(int64type, 0));
+              arith::ConstantOp::create(b, loc, b.getIntegerAttr(int32type, 0));
           Value oneInt =
-              arith::ConstantOp::create(b, loc, b.getIntegerAttr(int64type, 1));
+              arith::ConstantOp::create(b, loc, b.getIntegerAttr(int32type, 1));
           Value lowerSub0 = arith::SubIOp::create(b, loc, lowerOrig0, oneInt);
           Value lowerSub1 = arith::SubIOp::create(b, loc, lowerOrig1, oneInt);
+          // floor(result): truncate-toward-zero, minus one when negative.
           Value lower0 = arith::SelectOp::create(b, loc, checkLowerBound0,
                                                  lowerSub0, lowerOrig0);
           Value lower1 = arith::SelectOp::create(b, loc, checkLowerBound1,
                                                  lowerSub1, lowerOrig1);
-          Value lowerValid0 = arith::SelectOp::create(b, loc, checkLowerBound0,
-                                                      zeroInt, lower0);
-          Value lowerValid1 = arith::SelectOp::create(b, loc, checkLowerBound1,
-                                                      zeroInt, lower1);
           Value upper0 =
-              arith::AddIOp::create(b, loc, int64type, lower0, oneInt);
+              arith::AddIOp::create(b, loc, int32type, lower0, oneInt);
           Value upper1 =
-              arith::AddIOp::create(b, loc, int64type, lower1, oneInt);
+              arith::AddIOp::create(b, loc, int32type, lower1, oneInt);
+          // Out-of-range on the high side: x >= H (floor(x) > H-1).  Grid
+          // values outside [-1, 1] (e.g. from unnormalized sampling
+          // locations) must not produce out-of-bounds extract indices.
+          Value lowerOutHigh0 = arith::CmpIOp::create(
+              b, loc, arith::CmpIPredicate::sgt, lower0, innerDim0c);
+          Value lowerOutHigh1 = arith::CmpIOp::create(
+              b, loc, arith::CmpIPredicate::sgt, lower1, innerDim1c);
+          // Out-of-range on the low side: x < -1 (upper index < 0).
+          Value upperOutLow0 = arith::CmpIOp::create(
+              b, loc, arith::CmpIPredicate::slt, upper0, zeroInt);
+          Value upperOutLow1 = arith::CmpIOp::create(
+              b, loc, arith::CmpIPredicate::slt, upper1, zeroInt);
+          Value lowerClamped0 = arith::SelectOp::create(
+              b, loc, lowerOutHigh0, innerDim0c, lower0);
+          Value lowerClamped1 = arith::SelectOp::create(
+              b, loc, lowerOutHigh1, innerDim1c, lower1);
+          Value lowerValid0 = arith::SelectOp::create(
+              b, loc, checkLowerBound0, zeroInt, lowerClamped0);
+          Value lowerValid1 = arith::SelectOp::create(
+              b, loc, checkLowerBound1, zeroInt, lowerClamped1);
           Value notValidUpper0 = arith::CmpIOp::create(
-              rewriter, loc, arith::CmpIPredicate::sgt, upper0, innerDim0c);
+              b, loc, arith::CmpIPredicate::sgt, upper0, innerDim0c);
           Value notValidUpper1 = arith::CmpIOp::create(
-              rewriter, loc, arith::CmpIPredicate::sgt, upper1, innerDim1c);
-          Value upperValid0 =
-              arith::SelectOp::create(b, loc, notValidUpper0, lower0, upper0);
-          Value upperValid1 =
-              arith::SelectOp::create(b, loc, notValidUpper1, lower1, upper1);
+              b, loc, arith::CmpIPredicate::sgt, upper1, innerDim1c);
+          Value upperValid0 = arith::SelectOp::create(
+              b, loc, upperOutLow0, zeroInt,
+              arith::SelectOp::create(b, loc, notValidUpper0, lowerClamped0,
+                                      upper0));
+          Value upperValid1 = arith::SelectOp::create(
+              b, loc, upperOutLow1, zeroInt,
+              arith::SelectOp::create(b, loc, notValidUpper1, lowerClamped1,
+                                      upper1));
+          // Per-axis zero-padding flags (PyTorch grid_sample semantics):
+          // the lower corner is zero when x < 0 or x >= H; the upper corner
+          // is zero when x >= H-1 or x < -1.
+          Value zeroLower0 =
+              arith::OrIOp::create(b, loc, checkLowerBound0, lowerOutHigh0);
+          Value zeroLower1 =
+              arith::OrIOp::create(b, loc, checkLowerBound1, lowerOutHigh1);
+          Value zeroUpper0 =
+              arith::OrIOp::create(b, loc, notValidUpper0, upperOutLow0);
+          Value zeroUpper1 =
+              arith::OrIOp::create(b, loc, notValidUpper1, upperOutLow1);
           Value lw0 =
               arith::IndexCastOp::create(b, loc, b.getIndexType(), lowerValid0);
           Value lw1 =
@@ -2665,25 +2717,29 @@ public:
               arith::IndexCastOp::create(b, loc, b.getIndexType(), upperValid1);
           Value N = linalg::IndexOp::create(b, loc, 0);
           Value C = linalg::IndexOp::create(b, loc, 1);
-          Value result00 = lambdaExtract(b, loc, input, N, C, lw0, lw1);
-          Value result00a = arith::SelectOp::create(b, loc, checkLowerBound0,
+          Value result00 =
+              extfIf(b, loc, lambdaExtract(b, loc, input, N, C, lw0, lw1));
+          Value result00a = arith::SelectOp::create(b, loc, zeroLower0,
                                                     zeroFloat, result00);
-          Value result00b = arith::SelectOp::create(b, loc, checkLowerBound1,
+          Value result00b = arith::SelectOp::create(b, loc, zeroLower1,
                                                     zeroFloat, result00a);
-          Value result01 = lambdaExtract(b, loc, input, N, C, lw0, up1);
-          Value result01a = arith::SelectOp::create(b, loc, notValidUpper1,
+          Value result01 =
+              extfIf(b, loc, lambdaExtract(b, loc, input, N, C, lw0, up1));
+          Value result01a = arith::SelectOp::create(b, loc, zeroUpper1,
                                                     zeroFloat, result01);
-          Value result01b = arith::SelectOp::create(b, loc, checkLowerBound0,
+          Value result01b = arith::SelectOp::create(b, loc, zeroLower0,
                                                     zeroFloat, result01a);
-          Value result10 = lambdaExtract(b, loc, input, N, C, up0, lw1);
-          Value result10a = arith::SelectOp::create(b, loc, notValidUpper0,
+          Value result10 =
+              extfIf(b, loc, lambdaExtract(b, loc, input, N, C, up0, lw1));
+          Value result10a = arith::SelectOp::create(b, loc, zeroUpper0,
                                                     zeroFloat, result10);
-          Value result10b = arith::SelectOp::create(b, loc, checkLowerBound1,
+          Value result10b = arith::SelectOp::create(b, loc, zeroLower1,
                                                     zeroFloat, result10a);
-          Value result11 = lambdaExtract(b, loc, input, N, C, up0, up1);
-          Value result11a = arith::SelectOp::create(b, loc, notValidUpper0,
+          Value result11 =
+              extfIf(b, loc, lambdaExtract(b, loc, input, N, C, up0, up1));
+          Value result11a = arith::SelectOp::create(b, loc, zeroUpper0,
                                                     zeroFloat, result11);
-          Value result11b = arith::SelectOp::create(b, loc, notValidUpper1,
+          Value result11b = arith::SelectOp::create(b, loc, zeroUpper1,
                                                     zeroFloat, result11a);
           Value lw0a = arith::SIToFPOp::create(b, loc, floatType, lower0);
           Value lw1a = arith::SIToFPOp::create(b, loc, floatType, lower1);
@@ -2695,6 +2751,9 @@ public:
               lambdaInterpolate(b, loc, interMode, result10b, result11b, d0);
           Value resultScaled = lambdaInterpolate(
               b, loc, interMode, resultScaled0, resultScaled1, d1);
+          if (resultScaled.getType() != resultType.getElementType())
+            resultScaled = arith::TruncFOp::create(
+                b, loc, resultType.getElementType(), resultScaled);
           linalg::YieldOp::create(b, loc, resultScaled);
         });
     rewriter.replaceOp(op, sGrid.getResults());
