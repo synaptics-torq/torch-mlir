@@ -4665,6 +4665,154 @@ public:
 };
 } // namespace
 
+// Decompose `aten.meshgrid` / `aten.meshgrid.indexing` into
+// `tensor.expand_shape` (via unsqueezeTensor) and `aten.broadcast_to`.
+//
+// Each meshgrid input must be 1-D.  With indexing="ij" (the default) output i
+// is input i reshaped to [1, ..., N_i, ..., 1] and broadcast to the full grid
+// size (N_0, ..., N_{k-1}).  With indexing="xy" (only valid for two inputs)
+// the roles of the two outputs are swapped relative to "ij": output 0 is built
+// from input 1 and output 1 from input 0.
+static LogicalResult decomposeMeshgrid(PatternRewriter &rewriter,
+                                       Operation *op, bool indexingXY);
+
+class DecomposeAtenMeshgridOp : public OpRewritePattern<AtenMeshgridOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenMeshgridOp op,
+                                PatternRewriter &rewriter) const override {
+    return decomposeMeshgrid(rewriter, op, /*indexingXY=*/false);
+  }
+};
+
+class DecomposeAtenMeshgridIndexingOp
+    : public OpRewritePattern<AtenMeshgridIndexingOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenMeshgridIndexingOp op,
+                                PatternRewriter &rewriter) const override {
+    std::string indexing;
+    if (!matchPattern(op.getIndexing(), m_TorchConstantStr(indexing)) ||
+        (indexing != "ij" && indexing != "xy"))
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: only indexing='ij' and 'xy' are supported");
+    return decomposeMeshgrid(rewriter, op, /*indexingXY=*/indexing == "xy");
+  }
+};
+
+static LogicalResult decomposeMeshgrid(PatternRewriter &rewriter,
+                                       Operation *op, bool indexingXY) {
+  Location loc = op->getLoc();
+  MLIRContext *context = op->getContext();
+
+  auto tensorsOp = dyn_cast<AtenMeshgridOp>(op);
+  Value tensors = tensorsOp ? tensorsOp.getTensors()
+                            : cast<AtenMeshgridIndexingOp>(op).getTensors();
+
+  SmallVector<Value> meshInputs;
+  if (!getListConstructElements(tensors, meshInputs))
+    return rewriter.notifyMatchFailure(
+        op, "unimplemented: the tensor list is not from list construct");
+  unsigned numInputs = meshInputs.size();
+  if (numInputs < 1 || numInputs > 4)
+    return rewriter.notifyMatchFailure(
+        op, "unimplemented: only 1 to 4 meshgrid inputs are supported");
+  if (indexingXY && numInputs != 2)
+    return rewriter.notifyMatchFailure(
+        op, "unimplemented: indexing='xy' requires exactly 2 inputs");
+
+  // Static size of each 1-D input; also the full grid size per dimension.
+  SmallVector<int64_t> sizes(numInputs);
+  for (unsigned i = 0; i < numInputs; ++i) {
+    auto inputType = dyn_cast<BaseTensorType>(meshInputs[i].getType());
+    if (!inputType || !inputType.hasSizes() || !inputType.hasDtype())
+      return rewriter.notifyMatchFailure(
+          op, "inputs must have static sizes and dtypes");
+    if (inputType.getSizes().size() != 1 || !inputType.getSizes()[0])
+      return rewriter.notifyMatchFailure(
+          op, "inputs must be 1-D with a static size");
+    sizes[i] = inputType.getSizes()[0];
+  }
+
+  auto makeIntList = [&](ArrayRef<int64_t> values) -> Value {
+    SmallVector<Value> valueConstants;
+    for (int64_t value : values)
+      valueConstants.push_back(Torch::ConstantIntOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(value)));
+    return PrimListConstructOp::create(
+        rewriter, loc, Torch::ListType::get(Torch::IntType::get(context)),
+        valueConstants);
+  };
+
+  SmallVector<Value> outputs;
+  for (unsigned i = 0; i < numInputs; ++i) {
+    // Which input feeds output i, and along which axis it is spread.
+    unsigned srcDim = indexingXY ? (numInputs - 1 - i) : i;
+    Value src = meshInputs[srcDim];
+    Type dtype = cast<BaseTensorType>(src.getType()).getDtype();
+
+    // Raise the rank to N by inserting a unit dim at every position other
+    // than srcDim (tensor.expand_shape, which is backend-safe).
+    for (int64_t d = (int64_t)numInputs - 1; d >= 0; --d) {
+      if (d == (int64_t)srcDim)
+        continue;
+      Value dimCst = Torch::ConstantIntOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(d));
+      auto unsqueezed = unsqueezeTensor(rewriter, op, src, dimCst);
+      if (failed(unsqueezed))
+        return rewriter.notifyMatchFailure(op, "cannot unsqueeze tensor");
+      src = *unsqueezed;
+    }
+
+    // broadcast to the full grid size.
+    auto fullType = ValueTensorType::get(context, sizes, dtype);
+    outputs.push_back(AtenBroadcastToOp::create(
+                          rewriter, loc, fullType, src, makeIntList(sizes))
+                          .getResult());
+  }
+
+  rewriter.replaceOpWithNewOp<PrimListConstructOp>(
+      op, cast<ListType>(op->getResult(0).getType()), outputs);
+  return success();
+}
+
+// Decompose `aten.outer` into `tensor.expand_shape` (via unsqueezeTensor) and
+// `aten.mul`: outer(x[M], y[N]) = x.unsqueeze(-1) * y.unsqueeze(0).
+class DecomposeAtenOuterOp : public OpRewritePattern<AtenOuterOp> {
+public:
+  using OpRewritePattern::OpRewritePattern;
+  LogicalResult matchAndRewrite(AtenOuterOp op,
+                                PatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    Value x = op.getSelf();
+    Value y = op.getVec2();
+    auto xType = dyn_cast<BaseTensorType>(x.getType());
+    auto yType = dyn_cast<BaseTensorType>(y.getType());
+    if (!xType || !yType || !xType.hasSizes() || !yType.hasSizes() ||
+        !xType.hasDtype() || !yType.hasDtype() || xType.getSizes().size() != 1 ||
+        yType.getSizes().size() != 1 || !xType.areAllSizesKnown() ||
+        !yType.areAllSizesKnown() || xType.getDtype() != yType.getDtype())
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: outer requires 1-D inputs with static sizes "
+              "and equal dtypes");
+
+    auto xDimOne = Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(1));
+    auto xUnsq = unsqueezeTensor(rewriter, op, x, xDimOne);
+    if (failed(xUnsq))
+      return rewriter.notifyMatchFailure(op, "cannot unsqueeze x");
+    auto yDimZero = Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(0));
+    auto yUnsq = unsqueezeTensor(rewriter, op, y, yDimZero);
+    if (failed(yUnsq))
+      return rewriter.notifyMatchFailure(op, "cannot unsqueeze y");
+
+    rewriter.replaceOpWithNewOp<AtenMulTensorOp>(
+        op, op.getType(), *xUnsq, *yUnsq);
+    return success();
+  }
+};
+
 // Decompose `aten.hstack` into `aten.at_least1d` and `aten.cat`.
 // https://github.com/pytorch/pytorch/blob/207564bab1c4fe42750931765734ee604032fb69/torch/_refs/__init__.py#L3908
 namespace {
@@ -11292,44 +11440,168 @@ public:
 
 namespace {
 // Decompose `aten.topk` op into `aten.sort` and `aten.slice.Tensor` op.
+// Decompose `aten.topk` (sorted=True) into a sequence of `aten.max.dim` /
+// `aten.min.dim` selections.
+//
+// The classic sort-based decomposition cannot be used because `aten.sort` has
+// no TorchToLinalg lowering.  Iterative selection unrolls k times: each
+// iteration takes the argmax (resp. argmin) along `dim` with keepdim, records
+// the (value, index) pair, and masks the selected position out of the running
+// tensor so it is not selected again.  The result is naturally sorted
+// (descending for largest=True, ascending otherwise) and equal values resolve
+// to the lowest index at each step, matching torch.topk.
 class DecomposeAtenTopkOp : public OpRewritePattern<AtenTopkOp> {
 public:
   using OpRewritePattern::OpRewritePattern;
   LogicalResult matchAndRewrite(AtenTopkOp op,
                                 PatternRewriter &rewriter) const override {
     Location loc = op.getLoc();
-    auto context = op.getContext();
+    MLIRContext *context = op.getContext();
+
+    int64_t k;
+    if (!matchPattern(op.getK(), m_TorchConstantInt(&k)))
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: k must be a constant");
+    if (k < 1)
+      return rewriter.notifyMatchFailure(op, "unimplemented: k must be >= 1");
+
+    int64_t dim;
+    if (!matchPattern(op.getDim(), m_TorchConstantInt(&dim)))
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: dim must be a constant");
+
+    bool largest;
+    if (!matchPattern(op.getLargest(), m_TorchConstantBool(&largest)))
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: largest must be a constant");
 
     bool sorted;
     if (!matchPattern(op.getSorted(), m_TorchConstantBool(&sorted)))
       return rewriter.notifyMatchFailure(
-          op, "Expected a constant boolean value for sorted");
+          op, "unimplemented: sorted must be a constant");
     if (!sorted)
       return rewriter.notifyMatchFailure(
           op, "unimplemented: sorted value arg must be set to True");
 
     Value self = op.getSelf();
-    Value dim = op.getDim();
     auto selfType = cast<BaseTensorType>(self.getType());
-    auto sortIndicesType = selfType.getWithSizesAndDtype(
-        selfType.getOptionalSizes(),
-        IntegerType::get(context, 64, IntegerType::Signed));
-    auto sortOpResult = AtenSortOp::create(rewriter, loc, self.getType(),
-                                           sortIndicesType, self, dim,
-                                           /*descending=*/op.getLargest());
-    Value start = Torch::ConstantIntOp::create(rewriter, loc,
-                                               rewriter.getI64IntegerAttr(0));
-    Value step = Torch::ConstantIntOp::create(rewriter, loc,
-                                              rewriter.getI64IntegerAttr(1));
-    Value resultValue =
-        AtenSliceTensorOp::create(rewriter, loc, op->getResultTypes()[0],
-                                  sortOpResult->getResult(0), dim, start,
-                                  /*end=*/op.getK(), step);
+    if (!selfType.hasSizes() || !selfType.hasDtype())
+      return rewriter.notifyMatchFailure(
+          op, "self must have static sizes and a dtype");
+    if (!selfType.areAllSizesKnown())
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: self must have fully static sizes");
+    ArrayRef<int64_t> selfSizes = selfType.getSizes();
+    unsigned rank = selfSizes.size();
+    dim = toPositiveDim(dim, rank);
+    if (!isValidDim(dim, rank))
+      return rewriter.notifyMatchFailure(op, "dim is not a valid dim");
+    int64_t dimSize = selfSizes[dim];
+    if (dimSize < k)
+      return rewriter.notifyMatchFailure(
+          op, "unimplemented: the size along dim must be >= k");
+
+    Type dtype = selfType.getDtype();
+    auto i64Type = rewriter.getIntegerType(/*width=*/64, /*isSigned=*/true);
+    // The per-element index comparison must run in a dtype the torq kernels
+    // support (i32); there is no i64 data path.  Indices are < N which fits
+    // in i32 for any realistic sequence length.
+    auto i32Type = rewriter.getIntegerType(/*width=*/32, /*isSigned=*/true);
+
+    Value dimConstant = Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(dim));
+    Value keepdimTrue = Torch::ConstantBoolOp::create(rewriter, loc, true);
+
+    // Index grid along `dim`, shaped [1, ..., N, ..., 1], used to build the
+    // mask that clears the selected position after each iteration.
+    Value none = Torch::ConstantNoneOp::create(rewriter, loc);
+    auto i32DtypeInt = getDtypeIntValueForType(rewriter, loc, i32Type);
+    auto arangeType = ValueTensorType::get(
+        context, llvm::ArrayRef<int64_t>({dimSize}), i32Type);
+    Value end = Torch::ConstantIntOp::create(
+        rewriter, loc, rewriter.getI64IntegerAttr(dimSize));
+    Value grid = AtenArangeOp::create(rewriter, loc, arangeType, end,
+                                      /*dtype=*/i32DtypeInt, /*layout=*/none,
+                                      /*device=*/none, /*pin_memory=*/none);
+    // Raise the rank to the input's rank, placing N at `dim`.
+    for (int64_t d = (int64_t)rank - 1; d >= 0; --d) {
+      if (d == dim)
+        continue;
+      Value dimCst = Torch::ConstantIntOp::create(
+          rewriter, loc, rewriter.getI64IntegerAttr(d));
+      auto unsqueezed = unsqueezeTensor(rewriter, op, grid, dimCst);
+      if (failed(unsqueezed))
+        return rewriter.notifyMatchFailure(op, "cannot unsqueeze grid");
+      grid = *unsqueezed;
+    }
+
+    // Mask fill value: -inf when selecting maxima (so the selected position
+    // is never chosen again), +inf when selecting minima.
+    mlir::FloatType f64Type = rewriter.getF64Type();
+    APFloat infAPFloat =
+        APFloat::getInf(f64Type.getFloatSemantics(), /*negative=*/largest);
+    Value fillValue = Torch::ConstantFloatOp::create(
+        rewriter, loc, rewriter.getFloatAttr(f64Type, infAPFloat));
+
+    // Keepdim shapes for the per-iteration (value, index) results.
+    SmallVector<int64_t> keepSizes(rank);
+    for (unsigned i = 0; i < rank; ++i)
+      keepSizes[i] = (i == dim) ? 1 : selfSizes[i];
+    auto valueKeepType =
+        selfType.getWithSizesAndDtype(llvm::ArrayRef(keepSizes), dtype);
+    auto indexKeepType =
+        selfType.getWithSizesAndDtype(llvm::ArrayRef(keepSizes), i64Type);
+    auto maskType = selfType.getWithSizesAndDtype(selfType.getOptionalSizes(),
+                                                  rewriter.getI1Type());
+
+    Value running = self;
+    SmallVector<Value> values;
+    SmallVector<Value> indices;
+    for (int64_t i = 0; i < k; ++i) {
+      Value selectedValue, selectedIndex;
+      if (largest) {
+        auto maxDim = AtenMaxDimOp::create(
+            rewriter, loc, valueKeepType, indexKeepType, running, dimConstant,
+            keepdimTrue);
+        selectedValue = maxDim->getResult(0);
+        selectedIndex = maxDim->getResult(1);
+      } else {
+        auto minDim = AtenMinDimOp::create(
+            rewriter, loc, valueKeepType, indexKeepType, running, dimConstant,
+            keepdimTrue);
+        selectedValue = minDim->getResult(0);
+        selectedIndex = minDim->getResult(1);
+      }
+      values.push_back(selectedValue);
+      indices.push_back(selectedIndex);
+      // Compare in i32 (the grid is i32); the max/min index is i64, so narrow
+      // it first.  torq has no i64 data path, and the broadcast-compare of two
+      // i64 tensors would fail to lower.
+      Value selectedIndex32 =
+          convertTensorToDtype(rewriter, loc, selectedIndex, i32Type);
+      Value mask =
+          AtenEqTensorOp::create(rewriter, loc, maskType, selectedIndex32, grid);
+      running = AtenMaskedFillScalarOp::create(
+          rewriter, loc, selfType, running, mask, fillValue);
+    }
+
+    // Concatenate the keepdim (value, index) pairs along `dim`.
+    auto cat = [&](Value result, ArrayRef<Value> elements, Type elemType) {
+      Type listType = Torch::ListType::get(cast<BaseTensorType>(elemType)
+                                               .getWithSizesAndDtype(
+                                                   /*optionalSizes=*/std::nullopt,
+                                                   /*optionalDtype=*/nullptr));
+      Value elementList =
+          PrimListConstructOp::create(rewriter, loc, listType, elements);
+      return AtenCatOp::create(rewriter, loc, result.getType(), elementList,
+                               dimConstant)
+          .getResult();
+    };
+    Value resultValues =
+        cat(op.getResult(0), values, op.getResult(0).getType());
     Value resultIndices =
-        AtenSliceTensorOp::create(rewriter, loc, op->getResultTypes()[1],
-                                  sortOpResult->getResult(1), dim, start,
-                                  /*end=*/op.getK(), step);
-    rewriter.replaceOp(op, {resultValue, resultIndices});
+        cat(op.getResult(1), indices, op.getResult(1).getType());
+    rewriter.replaceOp(op, {resultValues, resultIndices});
     return success();
   }
 };
@@ -13122,6 +13394,9 @@ public:
     addPatternIfTargetOpIsIllegal<
         DecomposeConstantTensorAllocLikeOp<AtenZerosLikeOp, 0>>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenStackOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeAtenMeshgridOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeAtenMeshgridIndexingOp>(patterns);
+    addPatternIfTargetOpIsIllegal<DecomposeAtenOuterOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenHstackOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenColumnStackOp>(patterns);
     addPatternIfTargetOpIsIllegal<DecomposeAtenRollOp>(patterns);
