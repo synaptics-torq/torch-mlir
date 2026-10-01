@@ -242,6 +242,24 @@ private:
 void TorchMatchSpecializedBackendOp::populateSpecializedConversions(
     TorchMatchSpecializedBackendOp &matcher) {
   matcher.populate(
+      "torch.aten.concat",
+      [](Torch::OperatorOp op,
+         ConversionPatternRewriter &rewriter) -> LogicalResult {
+        // aten::concat is a deprecated alias of aten::cat with the identical
+        // (Tensor[], int) -> Tensor signature.  Modern torch.export emits
+        // aten.cat, but `torch.concat(...)` in model code (e.g. RT-DETR's
+        // FPN/PAN feature fusion) still lowers to aten.concat, which has no
+        // dedicated generated op and is imported as a generic torch.operator.
+        // Rewrite it to the legal aten.cat so the backend can lower it.
+        if (op->getNumOperands() != 2 || op->getNumResults() != 1)
+          return failure();
+        auto catOp = Torch::AtenCatOp::create(
+            rewriter, op.getLoc(), op->getResultTypes()[0], op->getOperand(0),
+            op->getOperand(1));
+        rewriter.replaceOp(op, catOp);
+        return success();
+      });
+  matcher.populate(
       "torch.aten._scaled_dot_product_flash_attention_for_cpu",
       [](Torch::OperatorOp op,
          ConversionPatternRewriter &rewriter) -> LogicalResult {
