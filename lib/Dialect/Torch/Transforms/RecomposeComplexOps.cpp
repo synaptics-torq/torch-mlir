@@ -831,7 +831,15 @@ public:
     patterns.add<RecomposeUnbindListUnpack>(context);
     patterns.add<RecomposeUnbindGetItem>(context);
     patterns.add<RecomposeChunkListUnpack>(context);
-    patterns.add<RecomposeMeshgridIndexingListUnpack>(context);
+    // NB: RecomposeMeshgridIndexingListUnpack is intentionally not registered.
+    // It rewrites `listunpack(meshgrid(...))` into `aten.view` + `aten.expand`
+    // carrying *non-value* tensor types (built with
+    // NonValueTensorType::getWithLeastStaticInformation), which cannot satisfy
+    // the backend contract ("unsupported by backend contract: non-value tensor
+    // type") and is never fixed by MaximizeValueSemantics.  meshgrid is instead
+    // lowered by DecomposeAtenMeshgridOp / DecomposeAtenMeshgridIndexingOp in
+    // DecomposeComplexOps (tensor.expand_shape + aten.broadcast_to), which
+    // keeps value semantics.
 
     GreedyRewriteConfig config;
     config.setUseTopDownTraversal(true);
