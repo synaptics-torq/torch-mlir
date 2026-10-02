@@ -1388,6 +1388,7 @@ LogicalResult OnnxGruExpander(OpBinder binder,
     // if no b found, set to null and create one later
     B = nullptr;
   }
+  bool hasInitialH = !binder.tensorOperandAtIndex(initial_h, 5);
 
   int64_t hidden_size;
   if (binder.s64IntegerAttr(hidden_size, "hidden_size"))
@@ -1430,6 +1431,9 @@ LogicalResult OnnxGruExpander(OpBinder binder,
   if (binder.s64IntegerAttr(layout, "layout", 0))
     return rewriter.notifyMatchFailure(binder.op,
                                        "Unsupported layout attribute type.");
+  if (layout != 0 && layout != 1)
+    return rewriter.notifyMatchFailure(binder.op,
+                                       "Unsupported layout attribute value");
 
   // Validations
   auto XShape = xTy.getSizes();
@@ -1454,6 +1458,25 @@ LogicalResult OnnxGruExpander(OpBinder binder,
         << wTy.getSizes()[2] << ". ";
   }
 
+  // The gate slices of R and B and the loop state use hidden_size, so these
+  // shapes must match it exactly.
+  auto hasShape = [](Value value, ArrayRef<int64_t> shape) {
+    auto sizes = cast<ValueTensorType>(value.getType()).getOptionalSizes();
+    return sizes && *sizes == shape;
+  };
+  if (!hasShape(R, {num_directions, 3 * hidden_size, hidden_size}))
+    oss << "Expected R to have shape [num_directions, 3*hidden_size, "
+           "hidden_size]. ";
+  if (B && !hasShape(B, {num_directions, 6 * hidden_size}))
+    oss << "Expected B to have shape [num_directions, 6*hidden_size]. ";
+  SmallVector<int64_t> initialHShape =
+      layout == 0
+          ? SmallVector<int64_t>{num_directions, batch_size, hidden_size}
+          : SmallVector<int64_t>{batch_size, num_directions, hidden_size};
+  if (hasInitialH && !hasShape(initial_h, initialHShape))
+    oss << "Expected initial_h to have the static shape of the hidden state "
+           "for this layout. ";
+
   if (!oss.str().empty()) {
     return rewriter.notifyMatchFailure(binder.op, oss.str());
   }
@@ -1463,7 +1486,7 @@ LogicalResult OnnxGruExpander(OpBinder binder,
       llvm::SmallVector<int64_t>{num_directions, batch_size, hidden_size},
       xTy.getDtype());
 
-  if (binder.tensorOperandAtIndex(initial_h, 5)) {
+  if (!hasInitialH) {
     Value cstNumDirections =
         ConstantIntOp::create(b, intType, b.getI64IntegerAttr(num_directions));
     Value cstBatchSize =
@@ -1476,10 +1499,8 @@ LogicalResult OnnxGruExpander(OpBinder binder,
     Value cstDtype = getDtypeIntValueForType(rewriter, loc, xTy.getDtype());
     initial_h = AtenZerosOp::create(b, hTy, hShape, cstDtype, cstNone, cstNone,
                                     cstNone);
-  } else {
-    if (layout == 1) {
-      initial_h = StaticTranspose(b, initial_h, 0, 1);
-    }
+  } else if (layout == 1) {
+    initial_h = StaticTranspose(b, initial_h, 0, 1);
   }
 
   // The expansion runs every sequence to seq_len, so it only supports
@@ -1487,6 +1508,7 @@ LogicalResult OnnxGruExpander(OpBinder binder,
   if (!binder.tensorOperandAtIndex(sequence_lens, 4)) {
     SmallVector<int64_t> lens;
     if (!matchPattern(sequence_lens, m_OnnxListOfConstantInts(lens)) ||
+        static_cast<int64_t>(lens.size()) != batch_size ||
         !llvm::all_of(lens, [&](int64_t len) { return len == seq_len; }))
       return rewriter.notifyMatchFailure(
           binder.op, "Only sequence_lens equal to seq_length is supported");
