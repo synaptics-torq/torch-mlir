@@ -65,7 +65,8 @@ public:
     auto defaultDomainPatterns =
         std::make_unique<OnnxCustomOpConversionPattern>(
             context, "onnx.",
-            /*domainVersion=*/defaultOpsetVersion, options);
+            /*domainVersion=*/defaultOpsetVersion, options,
+            OnnxConversionOptions{gruSplitGatesMinElements});
     populateComMicrosoftDomain(*defaultDomainPatterns);
     populateDefaultDomainAtoF(*defaultDomainPatterns);
     populateDefaultDomainGtoP(*defaultDomainPatterns);
@@ -101,6 +102,13 @@ createTorchOnnxToTorchPass(bool allowNonFinites) {
   ConvertTorchOnnxToTorchOptions options;
   options.allowNonFinites = allowNonFinites;
   return std::make_unique<ConvertTorchOnnxToTorch>(options);
+}
+
+std::unique_ptr<OperationPass<func::FuncOp>>
+createTorchOnnxToTorchPass(const OnnxConversionOptions &options) {
+  ConvertTorchOnnxToTorchOptions passOptions;
+  passOptions.gruSplitGatesMinElements = options.gruSplitGatesMinElements;
+  return std::make_unique<ConvertTorchOnnxToTorch>(passOptions);
 }
 
 } // namespace mlir::torch::onnx_c

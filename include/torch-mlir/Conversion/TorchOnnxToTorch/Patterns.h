@@ -13,6 +13,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/DialectConversion.h"
+#include "torch-mlir/Conversion/TorchOnnxToTorch/Passes.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallString.h"
@@ -29,7 +30,8 @@ namespace mlir::torch::onnx_c {
 /// if (binder.tensorOperand(foo) || binder.tensorResultType(t))
 ///   return failure();
 struct OpBinder {
-  OpBinder(Operation *op) : op(op) {}
+  OpBinder(Operation *op, const OnnxConversionOptions &options = {})
+      : op(op), options(options) {}
 
   Location getLoc() { return op->getLoc(); }
 
@@ -420,6 +422,7 @@ struct OpBinder {
   }
 
   Operation *op;
+  OnnxConversionOptions options;
 };
 
 struct OnnxTorchToTorchOptions {
@@ -451,9 +454,11 @@ public:
 
   OnnxCustomOpConversionPattern(MLIRContext *context, std::string domainPrefix,
                                 int64_t domainVersion,
-                                const OnnxTorchToTorchOptions &options)
+                                const OnnxTorchToTorchOptions &options,
+                                OnnxConversionOptions onnxOptions = {})
       : OpConversionPattern(context), domainPrefix(std::move(domainPrefix)),
-        domainVersion(domainVersion), options(options) {
+        domainVersion(domainVersion), onnxOptions(onnxOptions),
+        options(options) {
     // Onnx lowerings could produce other Onnx operations during the rewrite.
     setHasBoundedRewriteRecursion();
   }
@@ -481,6 +486,7 @@ public:
 private:
   std::string domainPrefix;
   int64_t domainVersion;
+  OnnxConversionOptions onnxOptions;
   DenseMap<StringAttr, SmallVector<HandlerReg, 1>> namedHandlers;
   OnnxTorchToTorchOptions options;
 };

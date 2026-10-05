@@ -25,7 +25,12 @@ def ConvertTorchOnnxToTorch : Pass<"convert-torch-onnx-to-torch", "func::FuncOp"
     Option<"allowNonFinites", "allow-non-finites",
             "bool", /*default=*/"true",
             "When enabled (default), some ops may emit non-finites, for example, max pooling may compare values to an initial value of `-inf`. When disabled, non-finites will be replaced with the closest finite value for a given dtype.">,
-  ];
+      Option<"gruSplitGatesMinElements", "gru-split-gates-min-elements",
+             "int64_t", /*default=*/"0",
+             "When batch > 1, split a packed GRU gate matmul with at least "
+             "this many result elements into one matmul per gate. 0 never "
+             "splits.">
+    ];
 }
 
 #endif  // TORCHMLIR_CONVERSION_TORCHONNX_TO_TORCH_PASSES
