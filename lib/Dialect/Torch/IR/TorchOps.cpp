@@ -1580,7 +1580,7 @@ llvm::SmallVector<APInt> getFoldValueAtIndexInt(llvm::ArrayRef<Attribute> attrs,
     // APInt(1,1).getSExtValue() return allOnes 64-bit integer.
     // So here only distinguish signed integer.
     auto &apint = splattrs.back();
-    if (apint.getBitWidth() < bitwidth) {
+    if (apint.getBitWidth() != bitwidth) {
       if (isSigned) {
         apint = apint.sextOrTrunc(bitwidth);
       } else {
