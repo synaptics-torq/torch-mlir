@@ -128,7 +128,16 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
         if (gridRank != 4)
           return rewriter.notifyMatchFailure(binder.op,
                                              "only grid rank 4 supported");
-        if (inputShape[0] != gridShape[0])
+        // A dynamic batch (torch kUnknownSize) on either side is accepted:
+        // the two are equal at runtime (the dynamic one is usually a
+        // symbolic batch that shape propagation failed to fold, e.g. through
+        // TopK+Reshape in the detection head of an opset-16 RT-DETR export,
+        // where the feature map carries a static multi-scale N and the grid
+        // a ?); a genuine mismatch is caught later by the runtime shape
+        // checks.
+        if (inputShape[0] != gridShape[0] &&
+            inputShape[0] != Torch::kUnknownSize &&
+            gridShape[0] != Torch::kUnknownSize)
           return rewriter.notifyMatchFailure(
               binder.op, "N must be same for input and grid");
         if (gridShape[3] != 2)
