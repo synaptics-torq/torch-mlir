@@ -96,8 +96,16 @@ void mlir::torch::onnx_c::populateDefaultDomainGtoP(
                                                        operand, vApproximate);
         return success();
       });
+  // GridSample's required semantics (rank-4 NCHW input, rank-4 grid,
+  // mode linear|bilinear|nearest, padding_mode zeros, align_corners)
+  // are unchanged from opset 16; opset 18 only adds the optional
+  // extrapolation_value attribute, which this handler does not read.
+  // Registering at 16 (not 10) keeps the claim to versions whose
+  // exports are actually in use. The name is dynamically marked illegal
+  // by populateLegalizedNames regardless of version, so a model with a
+  // lower opset would fail legalization rather than skip the op.
   patterns.onOp(
-      "GridSample", 17,
+      "GridSample", 16,
       [](OpBinder binder, ConversionPatternRewriter &rewriter) {
         Torch::ValueTensorType resultType;
         Value input;
