@@ -4287,7 +4287,9 @@ public:
 };
 } // namespace
 
-// LeakyRelu = max(0,x) + negative_slope * min(0,x)
+// LeakyRelu = max(x, negative_slope * x)          if negative_slope is a
+//                                                 constant <= 1
+//           = max(0,x) + negative_slope * min(0,x)   otherwise
 namespace {
 class DecomposeAtenLeakyReluOp : public OpRewritePattern<AtenLeakyReluOp> {
 public:
@@ -4300,6 +4302,22 @@ public:
     auto resType = cast<BaseTensorType>(op.getType());
     if (!resType.hasDtype()) {
       return rewriter.notifyMatchFailure(op, "result should have dtype");
+    }
+
+    // For a <= 1, a * x <= x when x >= 0 and a * x >= x when x < 0, so
+    // max(x, a * x) is exactly LeakyRelu (for a > 1 the max picks the wrong
+    // branch). Two elementwise ops instead of four,
+    // and backends that match a multiply-by-constant and a two-input max (but
+    // not the max/min/mul/add form) can run it without a fallback.
+    double slope;
+    if (matchPattern(negativeSlope, m_TorchConstantFloat(&slope)) &&
+        slope <= 1.0 &&
+        isa<mlir::FloatType>(resType.getDtype())) {
+      Value scaledInput =
+          AtenMulScalarOp::create(rewriter, loc, resType, input, negativeSlope);
+      rewriter.replaceOpWithNewOp<AtenMaximumOp>(op, resType, input,
+                                                 scaledInput);
+      return success();
     }
 
     Value constantZero =
