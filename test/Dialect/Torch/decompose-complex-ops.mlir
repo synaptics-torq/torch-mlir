@@ -1807,3 +1807,33 @@ func.func @torch.aten.softplus(%arg0: !torch.vtensor<[3,4],f32>) -> !torch.vtens
   %0 = torch.aten.softplus %arg0, %beta, %threshold : !torch.vtensor<[3,4],f32>, !torch.int, !torch.int -> !torch.vtensor<[3,4],f32>
   return %0 : !torch.vtensor<[3,4],f32>
 }
+
+// -----
+
+// CHECK-LABEL: func.func @torch.aten.leaky_relu$const_slope(
+// CHECK-SAME:      %[[X:.*]]: !torch.vtensor<[3,4],f32>
+// CHECK:         %[[A:.*]] = torch.constant.float 1.000000e-02
+// CHECK:         %[[AX:.*]] = torch.aten.mul.Scalar %[[X]], %[[A]]
+// CHECK:         %[[RES:.*]] = torch.aten.maximum %[[X]], %[[AX]]
+// CHECK-NOT:     torch.aten.minimum
+// CHECK-NOT:     torch.aten.leaky_relu
+// CHECK:         return %[[RES]]
+func.func @torch.aten.leaky_relu$const_slope(%arg0: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
+  %slope = torch.constant.float 1.000000e-02
+  %0 = torch.aten.leaky_relu %arg0, %slope : !torch.vtensor<[3,4],f32>, !torch.float -> !torch.vtensor<[3,4],f32>
+  return %0 : !torch.vtensor<[3,4],f32>
+}
+
+// -----
+
+// A slope above 1 flips which branch is larger, so the general form is kept.
+// CHECK-LABEL: func.func @torch.aten.leaky_relu$slope_above_one(
+// CHECK:         torch.aten.maximum
+// CHECK:         torch.aten.minimum
+// CHECK:         torch.aten.mul.Scalar
+// CHECK:         torch.aten.add.Tensor
+func.func @torch.aten.leaky_relu$slope_above_one(%arg0: !torch.vtensor<[3,4],f32>) -> !torch.vtensor<[3,4],f32> {
+  %slope = torch.constant.float 2.000000e+00
+  %0 = torch.aten.leaky_relu %arg0, %slope : !torch.vtensor<[3,4],f32>, !torch.float -> !torch.vtensor<[3,4],f32>
+  return %0 : !torch.vtensor<[3,4],f32>
+}
